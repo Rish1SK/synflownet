@@ -82,11 +82,6 @@ blocks and for computing masks can be found in
 
 ## Training the CYP models
 
-**Do this before anything else.** The CYP datasets and checkpoints are not kept in the repository,
-so a fresh clone has no `CYP/data/`, `CYP/csv/` or `CYP/models/`. Every CYP reward and
-`score_all.py` loads the five checkpoints at startup and fails with
-`FileNotFoundError: no checkpoint at ...` until they exist.
-
 The proxies are trained once and then reused as a frozen reward term.
 
 ```bash
@@ -94,10 +89,6 @@ cd CYP
 python data.py              # downloads the five TDC Veith benchmarks -> data/*.tab
 python process_data.py      # cleans them                             -> csv/*_veith.csv
 ```
-
-`process_data.py` strips counterions to the largest fragment (~4% of the Veith molecules are
-salts), canonicalises, drops molecules carrying contradictory labels, and deduplicates. You end up
-with 12,047–13,089 molecules per isoform.
 
 Then train one model per isoform:
 
@@ -117,16 +108,6 @@ the epoch with the best validation AUPRC.
 > **A hyperparameter sweep has already been run** — 40 configurations per isoform over hidden size,
 > dropout and weight decay. The winning values are baked into each `train_cyp*.py`, and the full
 > results are in `CYP/sweep_<isoform>.json`. You do not need to run `sweep.py`.
-
-Test-set performance you should expect:
-
-| Isoform | AUROC | AUPRC | % positive |
-| ------- | ----- | ----- | ---------- |
-| CYP1A2  | 0.925 | 0.917 | 46.4%      |
-| CYP2C19 | 0.895 | 0.876 | 46.0%      |
-| CYP2C9  | 0.856 | 0.727 | 33.5%      |
-| CYP2D6  | 0.851 | 0.578 | 19.1%      |
-| CYP3A4  | 0.844 | 0.788 | 41.5%      |
 
 ## Reward functions
 
@@ -154,29 +135,6 @@ with the two that are optimised, because the penalty pushes the policy toward le
 chemotypes (mean logP drops from 3.7 to 1.7 as `s` rises). This is generalisation, not reward
 hacking — those three proxies never enter the reward.
 
-**Smoothed penalties outperform the raw product.** Each row is at the temperature β that works
-best for that penalty strength, over ~6,400 samples per run:
-
-| `--scale`       | β   | Unique | Mean sEH | Clean 0/5 | Useful  | logP |
-| --------------- | --- | ------ | -------- | --------- | ------- | ---- |
-| 0.00 (baseline) | 26  | 1,829  | 0.873    | 22.7%     | 227     | 3.63 |
-| **0.25**        | 26  | 2,094  | 0.850    | 59.9%     | **435** | 3.05 |
-| **0.50**        | 20  | 2,062  | 0.813    | 76.1%     | 405     | 2.69 |
-| **0.75**        | 18  | 2,136  | 0.792    | 91.2%     | 366     | 1.71 |
-| 1.00            | 16  | 2,300  | 0.772    | 91.9%     | 298     | 1.97 |
-
-_Useful_ = unique molecules with sEH > 0.875 that inhibit none of the five isoforms.
-
-**No temperature produces a clean baseline.** β moves the baseline's diversity but not its
-liability — across β ∈ [16, 32] the unconstrained policy stays between 20% and 25% clean, because
-the high-sEH region is lipophilic and CYP-liable whatever the sampling temperature. That is the gap
-the penalty term closes.
-
-The β in each row was found by first training a temperature-conditioned policy over
-`--sample_dist uniform --dist_params 16 32` and then generating at each β in that range with
-`--final_beta`, picking the best. Those sweeps are done — use the β listed above rather than
-repeating them.
-
 Pick `--scale` according to what you want:
 
 - **`0.25`** — the cheapest useful setting. At the same β = 26 it costs 0.023 in mean sEH (0.850
@@ -188,6 +146,10 @@ Pick `--scale` according to what you want:
 
 Going to `1.00` buys almost no extra cleanliness over `0.75` and costs a further 0.02 sEH, so the
 raw product is not recommended.
+
+The β for each model was found by first training a temperature-conditioned policy over
+`--sample_dist uniform --dist_params 16 32` and then generating at each β in that range with
+`--final_beta`, picking the best. Those sweeps are done — use the β listed below.
 
 ## Training
 
@@ -220,18 +182,26 @@ python src/synflownet/tasks/reactions_task_cyp.py \
     --sample_dist constant --dist_params 32
 ```
 
-Each `--dist_params` above is the β from the results table, so the model trains directly at the
-temperature that suits its penalty strength. The preference-conditioned run fixes β = 32 and
-conditions instead on the objective weights ω ~ Dirichlet(1, 1).
-
 Each run trains for 5,000 steps and then generates, writing
 `logs/<run name>_<timestamp>/final/generated_objs_*.db`.
 
 ## Generating
 
-Every training run ends with a generation pass, so a scored CSV is available as soon as training
-finishes. To draw more molecules from a trained model, re-invoke the same script with `--backoff`,
-which loads the finished checkpoint and skips training.
+Every training run ends with a generation pass (`num_final_gen_steps = 100`), so a fresh set of
+molecules already exists when training finishes — as SQLite databases in
+`logs/<run>/final/generated_objs_*.db`
+
+To draw a further set from an already-trained model, re-invoke the same script with `--backoff`,
+which loads the finished checkpoint and skips straight to generation.
+
+`score_all.py` turns a generation directory into one fully scored CSV — RDKit descriptors, the sEH
+proxy re-run as its own column, and all five CYP isoform probabilities:
+
+```bash
+python score_all.py logs/<run>/final --out Generated_molecules/myrun_scored.csv
+```
+
+With no `--out` the file lands in `Generated_molecules/<run directory name>_scored.csv`.
 
 **Smoothed-penalty models** — the model already trains at its chosen β, so generation takes no
 extra arguments beyond the scale:
@@ -252,23 +222,10 @@ for W in 0.0 0.25 0.5 0.75 1.0; do
 done
 ```
 
-Two things to watch:
-
-- **Pass `--scale` on every `--backoff` call.** It is not stored in the checkpoint and silently
-  reverts to 0.5, which would mis-score the reward column.
 - **Generation overwrites `logs/<run>/final` each time.** Score before moving to the next ω, and
   keep the `|| exit 1` so a failed run does not leave you scoring the previous molecules twice.
 
-## Scoring and reporting
-
-`score_all.py` turns a generation directory into one fully scored CSV — RDKit descriptors, the sEH
-proxy re-run as its own column, and all five CYP isoform probabilities:
-
-```bash
-python score_all.py logs/<run>/final --out Generated_molecules/myrun_scored.csv
-```
-
-With no `--out` the file lands in `Generated_molecules/<run directory name>_scored.csv`.
+## Analysis report of generated molecules
 
 `report.py` summarises one scored CSV, printing the report and saving it as a one-row CSV:
 
