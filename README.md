@@ -1,83 +1,307 @@
-
-
 [![arXiv](https://img.shields.io/badge/arXiv-1234.56789-b31b1b.svg)](https://arxiv.org/abs/2405.01155)
 [![Python versions](https://img.shields.io/badge/Python-3.9%2B-blue)](https://www.python.org/downloads/)
 [![license: MIT](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
 
-![GFlowNet](docs/synflownet_logo.png)
+# SynFlowNet with CYP450 Inhibition Rewards
 
-# SynFlowNet - Design of Diverse and Novel Molecules with Synthesis Constraints
-
-Official implementation of SynFlowNet, a GFlowNet model with a synthesis action space. The paper is available on [arxiv](https://arxiv.org/abs/2405.01155).
+A fork of [SynFlowNet](https://github.com/mirunacrt/synflownet) that generates molecules binding
+soluble epoxide hydrolase (sEH) while avoiding cytochrome P450 inhibition.
 
 **Primer**
 
-SynFlowNet is a GFlowNet model that generates molecules from chemical reactions and available building blocks. This repo contains instructions for how to train SynFlowNet and sample synthesisable molecules with probability proportional to a reward specified by the user. The code builds upon the [recursionpharma/gflownet](https://github.com/recursionpharma/gflownet) codebase, available under the [MIT](https://github.com/recursionpharma/gflownet/blob/trunk/LICENSE) license. For a primer and repo overview visit [recursionpharma/gflownet](https://github.com/recursionpharma/gflownet).
+SynFlowNet is a GFlowNet model that generates molecules from chemical reactions and available
+building blocks. This repo contains instructions for how to train SynFlowNet and sample
+synthesisable molecules with probability proportional to a reward specified by the user. The code
+builds upon the [recursionpharma/gflownet](https://github.com/recursionpharma/gflownet) codebase,
+available under the [MIT](https://github.com/recursionpharma/gflownet/blob/trunk/LICENSE) license.
+For a primer and repo overview visit
+[recursionpharma/gflownet](https://github.com/recursionpharma/gflownet).
 
-![GFlowNet](docs/concept.png)
+## What this fork adds
+
+Optimising sEH binding alone produces molecules that are reliably liable: about 69% of them inhibit
+CYP1A2 and 34% inhibit CYP3A4
+
+This fork adds a multi-objective reward that penalises predicted CYP inhibition alongside sEH
+affinity, and the machinery to train, sample and evaluate it:
+
+- **Five CYP inhibition proxies** (`CYP/`) — one GCN classifier per isoform (1A2, 2C19, 2C9, 2D6,
+  3A4), trained on the TDC Veith benchmarks with a scaffold split. The datasets and checkpoints are
+  not committed, so building them is the first step after installing (see
+  [Training the CYP models](#training-the-cyp-models)).
+- **Four new reward functions** in `src/synflownet/tasks/reactions_task_cyp.py` — a
+  smoothed sEH × CYP-safety product with a tunable penalty strength, a single-isoform variant, and
+  a preference-conditioned form that spans the whole trade-off with one trained model.
+- **A scoring and reporting pipeline** (`score_all.py`, `report.py`) that turns a generation run
+  into one CSV carrying the sEH score, all five isoform probabilities, and standard drug-likeness
+  descriptors.
+
+The headline result: at matched diversity, the smoothed reward raises the fraction of molecules
+clean on all five isoforms from **22% to 60–91%** while keeping mean sEH within 0.04 of the
+unconstrained baseline.
 
 ## Installation
 
 ### PIP
 
-This package is installable as a PIP package, but since it depends on some torch-geometric package wheels, the `--find-links` arguments must be specified as well:
+This package is installable as a PIP package, but since it depends on some torch-geometric package
+wheels, the `--find-links` arguments must be specified as well:
 
 ```bash
 conda create --name sfn python=3.10.14
 conda activate sfn
 pip install -e . --find-links https://data.pyg.org/whl/torch-2.1.2+cu121.html
 ```
+
 Or for CPU use:
 
 ```bash
 pip install -e . --find-links https://data.pyg.org/whl/torch-2.1.2+cpu.html
 ```
 
+The CYP code adds no dependencies of its own — `scikit-learn`, `rdkit`, `scipy` and `PyTDC` all
+arrive with the base install.
+
+One extra step is required, because `CYP/` is a directory of scripts rather than a package:
+
+```bash
+export PYTHONPATH=$PYTHONPATH:$(pwd)/CYP
+```
+
+Without it, training fails with `ModuleNotFoundError: predict`.
+
 ## Getting started
 
 ### Data
 
-The training relies on two data sources: reaction templates and building blocks. Filenames are specified in the `ReactionTaskConfig`. The model uses pre-computed masks to ensure compatibility between the building blocks and the reaction templates. Instructions for preprocessing building blocks and for computing masks can be found in [synflownet/data/building_blocks](https://github.com/mirunacrt/synflownet/tree/main/src/synflownet/data/building_blocks).
+The training relies on two data sources: reaction templates and building blocks. Filenames are
+specified in the `ReactionTaskConfig`. The model uses pre-computed masks to ensure compatibility
+between the building blocks and the reaction templates. Instructions for preprocessing building
+blocks and for computing masks can be found in
+[synflownet/data/building_blocks](src/synflownet/data/building_blocks).
 
-### Reward
+## Training the CYP models
 
-SynFlowNet uses a reward to guide the molecule generation process. We have implemented a few reward functions in the `ReactionTask` class. These include the SeH binding proxy, QED, oracles from [PyTDC](https://pypi.org/project/PyTDC/) and Vina docking (see below). Other reward functions can be imported in the `synflownet/tasks/reactions_task.py` file.
+**Do this before anything else.** The CYP datasets and checkpoints are not kept in the repository,
+so a fresh clone has no `CYP/data/`, `CYP/csv/` or `CYP/models/`. Every CYP reward and
+`score_all.py` loads the five checkpoints at startup and fails with
+`FileNotFoundError: no checkpoint at ...` until they exist.
 
-### Training
+The proxies are trained once and then reused as a frozen reward term.
 
-The model can be trained by running `synflownet/tasks/reactions_task.py` using different reward functions. You may want to change the default configuration in `main()`.
+```bash
+cd CYP
+python data.py              # downloads the five TDC Veith benchmarks -> data/*.tab
+python process_data.py      # cleans them                             -> csv/*_veith.csv
+```
 
-#### [Optional] If using GPU-accelerated Vina
+`process_data.py` strips counterions to the largest fragment (~4% of the Veith molecules are
+salts), canonicalises, drops molecules carrying contradictory labels, and deduplicates. You end up
+with 12,047–13,089 molecules per isoform.
 
-For easy adoption to other targets, a GPU-accelerated version of Vina docking can be used to calculate rewards as binding affinities to targets of interest. Follow the instructions at [this repo](https://github.com/DeltaGroupNJUPT/Vina-GPU-2.1) to compile an excuteable for `QuickVina2-GPU-2-1`. One done, place the excuteable in `bin/`.
+Then train one model per isoform:
 
-## Implementation notes
+```bash
+python train_cyp1a2.py
+python train_cyp2c19.py
+python train_cyp2c9.py
+python train_cyp2d6.py
+python train_cyp3a4.py
+```
 
-Below is a breakdown of the different components of SynFlowNet. 
+Each writes `models/<isoform>_gcn.pt`. The architecture is a 3-layer GCN
+(`GCNConv → BatchNorm → ReLU → Dropout`) with hidden size 128 and mean pooling, 38,913 parameters,
+on 33-dimensional atom features. Training uses AdamW, a 70/20/10 **scaffold** split, and selects
+the epoch with the best validation AUPRC.
 
-### Environment, Context, Task, Trainers
+> **A hyperparameter sweep has already been run** — 40 configurations per isoform over hidden size,
+> dropout and weight decay. The winning values are baked into each `train_cyp*.py`, and the full
+> results are in `CYP/sweep_<isoform>.json`. You do not need to run `sweep.py`.
 
-We separate experiment concerns in four categories:
+Test-set performance you should expect:
 
-- `ReactionTemplateEnv` is the definition of the reaction MDP and it implements stepping forward and backward in the environment.
-- `ReactionTemplateEnvContext` provides an interface between the agent and the environment, it
-  - maps graphs to other molecule representations and to torch_geometric `Data` instances 
-  - maps GraphActions to action indices
-  - creates masks for actions
-  - communicates with the model what inputs it should expect
-- The `ReactionTask` class is responsible for computing rewards, and for sampling conditional information
-- The `ReactionTrainer` class is responsible for instanciating everything, and running the training loop
+| Isoform | AUROC | AUPRC | % positive |
+| ------- | ----- | ----- | ---------- |
+| CYP1A2  | 0.925 | 0.917 | 46.4%      |
+| CYP2C19 | 0.895 | 0.876 | 46.0%      |
+| CYP2C9  | 0.856 | 0.727 | 33.5%      |
+| CYP2D6  | 0.851 | 0.578 | 19.1%      |
+| CYP3A4  | 0.844 | 0.788 | 41.5%      |
 
-### Policies and action categoricals
+## Reward functions
 
-The `GraphTransformerSynGFN` class is used to parameterize the policies and outputs a specific categorical distribution type for the actions defined in `ReactionTemplateEnvContext`. If `config.model.graph_transformer.continuous_action_embs` is set to `True`, then the probability of sampling building blocks is computed from the normalized dot product of the molecule representation and the embedding vector of the state. The `ActionCategorical` class contains the logic to sample from the hierarchical distribution of actions. 
+All CYP rewards multiply the sEH binding proxy by a safety term computed from the **CYP1A2 and
+CYP3A4** proxies only. The other three isoforms are never optimised against — they are held out,
+and used at evaluation time to check whether the policy generalises.
 
-### Data sources
+| `--reward`        | Formula             | Notes                                                |
+| ----------------- | ------------------- | ---------------------------------------------------- |
+| `seh_reaction`    | sEH                 | unconstrained baseline                               |
+| `seh_cyp1a2`      | sEH · (1 − p₁ₐ₂)    | single isoform                                       |
+| `seh_cyp1a2_3a4`  | sEH · (1 − s · p̄)   | **the main reward**, `s` set by `--scale`            |
+| `seh_cyp_product` | sEH · (1 − p̄)       | the above at `s` = 1                                 |
+| `seh_cyp_pref`    | sEH^w₁ · (1 − p̄)^w₂ | preference-conditioned, one model spans the frontier |
 
-The data used for training the GFlowNet can come from multiple sources:
-- Generating new trajectories on-policy from _s_0_
-- Generating new trajectories on-policy backwards from samples stored in a replay buffer (for training the backwards policy with REINFORCE)
-- Sampling trajectories from a fixed, offline dataset
+where p̄ = mean(p₁ₐ₂, p₃ₐ₄).
+
+### The smoothing parameter
+
+`--scale` sets how hard the penalty bites: the safety term spans `[1 − s, 1]`, so `s` = 1 can
+annihilate the reward entirely while `s` = 0.25 costs at most a quarter of it.
+
+**Penalising two isoforms reduces inhibition of all five.** CYP2C19, CYP2C9 and CYP2D6 fall along
+with the two that are optimised, because the penalty pushes the policy toward less lipophilic
+chemotypes (mean logP drops from 3.7 to 1.7 as `s` rises). This is generalisation, not reward
+hacking — those three proxies never enter the reward.
+
+**Smoothed penalties outperform the raw product.** Each row is at the temperature β that works
+best for that penalty strength, over ~6,400 samples per run:
+
+| `--scale`       | β   | Unique | Mean sEH | Clean 0/5 | Useful  | logP |
+| --------------- | --- | ------ | -------- | --------- | ------- | ---- |
+| 0.00 (baseline) | 26  | 1,829  | 0.873    | 22.7%     | 227     | 3.63 |
+| **0.25**        | 26  | 2,094  | 0.850    | 59.9%     | **435** | 3.05 |
+| **0.50**        | 20  | 2,062  | 0.813    | 76.1%     | 405     | 2.69 |
+| **0.75**        | 18  | 2,136  | 0.792    | 91.2%     | 366     | 1.71 |
+| 1.00            | 16  | 2,300  | 0.772    | 91.9%     | 298     | 1.97 |
+
+_Useful_ = unique molecules with sEH > 0.875 that inhibit none of the five isoforms.
+
+**No temperature produces a clean baseline.** β moves the baseline's diversity but not its
+liability — across β ∈ [16, 32] the unconstrained policy stays between 20% and 25% clean, because
+the high-sEH region is lipophilic and CYP-liable whatever the sampling temperature. That is the gap
+the penalty term closes.
+
+The β in each row was found by first training a temperature-conditioned policy over
+`--sample_dist uniform --dist_params 16 32` and then generating at each β in that range with
+`--final_beta`, picking the best. Those sweeps are done — use the β listed above rather than
+repeating them.
+
+Pick `--scale` according to what you want:
+
+- **`0.25`** — the cheapest useful setting. At the same β = 26 it costs 0.023 in mean sEH (0.850
+  vs 0.873) and returns 2.6× the clean rate and 1.9× the useful molecules. The best yield of the
+  three.
+- **`0.50`** — balanced. Three quarters of the output is clean, at a 0.04 cost in mean sEH.
+- **`0.75`** — clean-heavy. Over 90% clean, but mean sEH drops to 0.79 and the molecules become
+  noticeably less lipophilic.
+
+Going to `1.00` buys almost no extra cleanliness over `0.75` and costs a further 0.02 sEH, so the
+raw product is not recommended.
+
+## Training
+
+Set `PYTHONPATH` first (see Installation). All runs use
+`src/synflownet/tasks/reactions_task_cyp.py`.
+
+```bash
+# scale 0.25 -- maximum sEH retention
+python src/synflownet/tasks/reactions_task_cyp.py \
+    --wandb_run_name sfn_cyp_025 \
+    --reward seh_cyp1a2_3a4 --scale 0.25 \
+    --sample_dist constant --dist_params 26
+
+# scale 0.50 -- balanced
+python src/synflownet/tasks/reactions_task_cyp.py \
+    --wandb_run_name sfn_cyp_050 \
+    --reward seh_cyp1a2_3a4 --scale 0.50 \
+    --sample_dist constant --dist_params 20
+
+# scale 0.75 -- clean-heavy
+python src/synflownet/tasks/reactions_task_cyp.py \
+    --wandb_run_name sfn_cyp_075 \
+    --reward seh_cyp1a2_3a4 --scale 0.75 \
+    --sample_dist constant --dist_params 18
+
+# preference-conditioned -- one model for the whole trade-off
+python src/synflownet/tasks/reactions_task_cyp.py \
+    --wandb_run_name sfn_cyp_pc \
+    --reward seh_cyp_pref \
+    --sample_dist constant --dist_params 32
+```
+
+Each `--dist_params` above is the β from the results table, so the model trains directly at the
+temperature that suits its penalty strength. The preference-conditioned run fixes β = 32 and
+conditions instead on the objective weights ω ~ Dirichlet(1, 1).
+
+Each run trains for 5,000 steps and then generates, writing
+`logs/<run name>_<timestamp>/final/generated_objs_*.db`.
+
+## Generating
+
+Every training run ends with a generation pass, so a scored CSV is available as soon as training
+finishes. To draw more molecules from a trained model, re-invoke the same script with `--backoff`,
+which loads the finished checkpoint and skips training.
+
+**Smoothed-penalty models** — the model already trains at its chosen β, so generation takes no
+extra arguments beyond the scale:
+
+```bash
+python src/synflownet/tasks/reactions_task_cyp.py \
+    --wandb_run_name sfn_cyp_050 --backoff --scale 0.50 || exit 1
+python score_all.py "logs/${RUN}/final" --out Generated_molecules/cyp050_scored.csv
+```
+
+**Preference-conditioned model** — sweep ω₁, the weight on sEH, from pure safety to pure affinity:
+
+```bash
+for W in 0.0 0.25 0.5 0.75 1.0; do
+    python src/synflownet/tasks/reactions_task_cyp.py \
+        --wandb_run_name sfn_cyp_pc --backoff --final_pref "$W" || exit 1
+    python score_all.py "logs/${RUN}/final" --out "Generated_molecules/pc_w${W}_scored.csv"
+done
+```
+
+Two things to watch:
+
+- **Pass `--scale` on every `--backoff` call.** It is not stored in the checkpoint and silently
+  reverts to 0.5, which would mis-score the reward column.
+- **Generation overwrites `logs/<run>/final` each time.** Score before moving to the next ω, and
+  keep the `|| exit 1` so a failed run does not leave you scoring the previous molecules twice.
+
+## Scoring and reporting
+
+`score_all.py` turns a generation directory into one fully scored CSV — RDKit descriptors, the sEH
+proxy re-run as its own column, and all five CYP isoform probabilities:
+
+```bash
+python score_all.py logs/<run>/final --out Generated_molecules/myrun_scored.csv
+```
+
+With no `--out` the file lands in `Generated_molecules/<run directory name>_scored.csv`.
+
+`report.py` summarises one scored CSV, printing the report and saving it as a one-row CSV:
+
+```bash
+python report.py Generated_molecules/myrun_scored.csv
+```
+
+```
+  samples                              6398
+  unique                               1581
+  scaffolds                            1480
+  diversity (1-Tanimoto)             0.8466
+
+  mean sEH                           0.8152
+  sEH > 0.875                         27.5%
+
+  inhibits CYP1A2                      5.6%
+  inhibits CYP2C19                     6.5%
+  inhibits CYP2C9                      2.2%
+  inhibits CYP2D6                      2.3%
+  inhibits CYP3A4                      3.2%
+  clean 0/5                           84.2%
+  useful (hot & clean)                  345
+
+  SA                                  4.240
+  QED                                 0.674
+  logP                                2.155
+  Lipinski pass                       0.955
+```
+
+Every metric except `samples` is computed over unique canonical SMILES. Generated samples are drawn
+in proportion to reward, so a molecule sampled 700 times would otherwise count 700 times and the
+quality numbers would mostly be measuring how collapsed the policy is.
 
 # Citation
 
@@ -89,5 +313,17 @@ If you use this code in your research, please cite the following paper:
       author={Miruna Cretu, Charles Harris, Ilia Igashov, Arne Schneuing, Marwin Segler, Bruno Correia, Julien Roy, Emmanuel Bengio and Pietro Liò},
       journal={arXiv preprint arXiv},
       year={2024}
+}
+```
+
+The CYP inhibition data comes from the Therapeutics Data Commons ADME benchmarks, originally from:
+
+```
+@article{veith2009comprehensive,
+      title={Comprehensive characterization of cytochrome P450 isozyme selectivity across chemical libraries},
+      author={Veith, Henrike and Southall, Noel and Huang, Ruili and James, Tim and Fayne, Darren and Artemenko, Natalia and Shen, Min and Inglese, James and Austin, Christopher P and Lloyd, David G and Auld, Douglas S},
+      journal={Nature Biotechnology},
+      volume={27}, number={11}, pages={1050--1055},
+      year={2009}
 }
 ```
