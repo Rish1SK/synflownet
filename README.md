@@ -102,7 +102,7 @@ python train_cyp3a4.py
 
 Each writes `models/<isoform>_gcn.pt`. The architecture is a 3-layer GCN
 (`GCNConv → BatchNorm → ReLU → Dropout`) with hidden size 128 and mean pooling, 38,913 parameters,
-on 33-dimensional atom features. Training uses AdamW, a 70/20/10 **scaffold** split, and selects
+on 38-dimensional atom features. Training uses AdamW, a 70/20/10 **scaffold** split, and selects
 the epoch with the best validation AUPRC.
 
 > **A hyperparameter sweep has already been run** — 40 configurations per isoform over hidden size,

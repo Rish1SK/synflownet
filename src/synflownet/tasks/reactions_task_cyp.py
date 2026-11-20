@@ -33,37 +33,17 @@ from synflownet.utils.transforms import thermometer, to_logreward
 
 # Write any local overrides required here
 LOCAL_OVERRIDES = "local_overrides.yaml"
-
-# Preference used for the final generation pass: weight on sEH, so the
-# objective sampled is FINAL_PREF*sEH + (1-FINAL_PREF)*CYP_safe. During
-# training omega is drawn from a Dirichlet; this pins it so the generated
-# molecules correspond to one point on the trade-off rather than a mixture.
 FINAL_PREF = 0.5
-# No caller ever passes final=True to sample_conditional_information, so the
-# pinning has to be driven by a flag instead. Set by --final_pref.
 PIN_PREF = False
-
-# Temperature used for the final generation pass. TempCondConfig is a strict
-# dataclass so this cannot live in the config; --final_beta sets it to sample a
-# beta-conditioned policy at one point on the curve.
 FINAL_BETA = 16.0
 PIN_BETA = False
-
-# Preference-conditioned reward: compute_reward_from_graph returns (n, 2) and
-# preference conditioning is switched on. Everything else returns (n,).
 PREF_REWARDS = ("seh_cyp_pref",)
-# Rewards that need the CYP proxy ensemble loaded in __init__.
 CYP_REWARDS = ("seh_cyp1a2", "seh_cyp1a2_3a4", "seh_cyp_product") + PREF_REWARDS
 
 # Set by --reward / --sample_dist / --dist_params.
 REWARD = "seh_cyp_pref"
 SAMPLE_DIST = "constant"
 DIST_PARAMS = [32.0]
-
-# Strength of the CYP penalty in seh_cyp1a2_3a4: sEH * (1 - SCALE * mean p).
-# scale 0.25 / 0.50 / 0.75 are the soft-product variants; seh_cyp_product forces
-# 1.0. NOTE: scale is NOT written into the checkpoint, so a --backoff generation
-# pass must be given the same --scale as the run that produced the checkpoint.
 SCALE = 0.5
 from synflownet.envs.graph_building_env import Graph
 
@@ -88,19 +68,12 @@ class ReactionTask(GFNTask):
         self.reward = cfg.reward
         self.is_pc = self.reward in PREF_REWARDS
         if self.reward in CYP_REWARDS:
-            # loaded here, before the dataloader forks its workers, so all of
-            # them inherit one copy rather than loading it each
             from predict import CypPredictor
 
             isoforms = ["cyp1a2"] if self.reward == "seh_cyp1a2" else ["cyp1a2", "cyp3a4"]
             self.cyp = CypPredictor(isoforms=isoforms, device="cpu")
         self.models = self._load_task_models()
         self.temperature_conditional = TemperatureConditional(cfg)
-        # Only built for the *_pref rewards. Building it unconditionally would widen
-        # num_cond_dim for every single-objective run as well (32 -> 64 with the
-        # default thermometer dims), which changes the policy's conditional input
-        # layer and makes such a run incomparable to -- and incompatible with the
-        # checkpoints of -- the single-objective experiments.
         self.pref_conditional = MultiObjectiveWeightedPreferences(cfg) if self.is_pc else None
         self.num_cond_dim = self.temperature_conditional.encoding_size() + (
             self.pref_conditional.encoding_size() if self.is_pc else 0
@@ -114,9 +87,6 @@ class ReactionTask(GFNTask):
 
     def sample_conditional_information(self, n: int, train_it: int, final: bool = False) -> Dict[str, Tensor]:
         if PIN_BETA:
-            # Pin beta but keep the encoding scheme the policy trained with: the
-            # "constant" branch of TemperatureConditional returns an all-zeros
-            # vector, which a uniform-trained policy has never seen.
             tcfg = self.cfg.cond.temperature
             beta = torch.full((n,), FINAL_BETA)
             if tcfg.sample_dist == "constant":
@@ -132,8 +102,6 @@ class ReactionTask(GFNTask):
             return temp
 
         if PIN_PREF:
-            # Pin omega so every generated molecule corresponds to one point on
-            # the trade-off, rather than its own random draw from the Dirichlet.
             prefs = torch.tensor([[FINAL_PREF, 1.0 - FINAL_PREF]]).repeat(n, 1).float()
             pref = {"preferences": prefs, "encoding": self.pref_conditional.encode(prefs)}
         else:
@@ -143,17 +111,8 @@ class ReactionTask(GFNTask):
 
     def cond_info_to_logreward(self, cond_info: Dict[str, Tensor], flat_reward: ObjectProperties) -> LogScalar:
         if self.reward == "seh_cyp_pref":
-            # Geometric (weighted-log-sum) scalarisation:
-            #     log R = sum_i w_i * log r_i   ==   log( prod_i r_i ** w_i )
-            # With w on the simplex this is a weighted geometric MEAN, so R stays
-            # on the scale of the objectives (all r_i = c  ->  R = c), unlike the
-            # bare product sEH*(1-p) which returns c**2. Consequence: beta does
-            # not transfer from the product runs -- product at beta=B is
-            # equivalent to this at w=(0.5,0.5), beta=2B. Sweep beta for this
-            # form on its own, as was done for the single-objective rewards.
-            # both objectives are already clipped to >= 1e-4 upstream, so log is safe
-            logr = flat_reward.log()                                # (n, num_objectives)
-            scalar_log = (logr * cond_info["preferences"]).sum(1)   # (n,)
+            logr = flat_reward.log()                               
+            scalar_log = (logr * cond_info["preferences"]).sum(1)   
             return LogScalar(self.temperature_conditional.transform(cond_info, LogScalar(scalar_log)))
         return LogScalar(self.temperature_conditional.transform(cond_info, to_logreward(flat_reward)))
 
@@ -208,13 +167,6 @@ class ReactionTask(GFNTask):
 
     def cyp_panel_rewards_from_mols(self, mols: List[RDMol], isoforms, scale: float = None) -> Tensor:
         """1 - scale * mean(p) over the given isoforms.
-
-        Averaging rather than multiplying keeps the term in [1 - scale, 1] with the
-        same relative spread as the single-isoform version. A product of two
-        (1 - p) terms roughly triples the reward's p5-p95 ratio, which at
-        beta=16 is about eight orders of magnitude more peaked and is the
-        condition that collapsed the beta=32 run.
-
         scale defaults to the module-level SCALE, set by --scale.
         """
         if scale is None:
@@ -270,9 +222,6 @@ class ReactionTask(GFNTask):
             qed_scores = (qed_scores / 0.7).clamp(0, 1)
             return seh_scores * qed_scores
         elif self.reward == "seh_cyp1a2":
-            # seh_proxy_reward_from_graph drops molecules whose graph is None, so the
-            # per-molecule term has to be computed on the same subset or the two
-            # tensors differ in length
             valid_mols = [m for m, g in zip(mols, graphs) if g is not None]
             seh_scores = self.seh_proxy_reward_from_graph(graphs, mols, traj_lens)
             return seh_scores * self.cyp1a2_rewards_from_mols(valid_mols)
@@ -285,7 +234,6 @@ class ReactionTask(GFNTask):
         elif self.reward == "seh_cyp_product":
             # Raw product: the CYP term spans [0, 1] rather than [1 - scale, 1], so it
             # separates clean from liable far harder at matched concentration and needs
-            # a lower beta -- roughly 10-22 here for what 16-32 covers at scale=0.5.
             valid_mols = [m for m, g in zip(mols, graphs) if g is not None]
             seh_scores = self.seh_proxy_reward_from_graph(graphs, mols, traj_lens)
             return seh_scores * self.cyp_panel_rewards_from_mols(valid_mols, ["cyp1a2", "cyp3a4"], scale=1.0)
